@@ -1,0 +1,123 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v2.json",
+  "width": 700,
+  "height": 500,
+  "config": {
+    "view": {
+      "stroke": "transparent"
+    }
+  },
+  "layer": [
+    {
+      "data": {
+        "url": "cache/Bbox.json",
+        "format": {
+          "type": "topojson",
+          "feature": "Bbox"
+        }
+
+      },
+      "projection": {
+        "type": "equirectangular"
+      },
+      "mark": {
+        "type": "geoshape",
+        "stroke": "black",
+        "strokeWidth": 2
+      },
+      "encoding": {
+        "color": {
+          "value": "#0000FF"
+        }
+      }
+    },
+    {
+      "data": {
+        "url": "cache/Stateb.json",
+        "format": {
+          "type": "topojson",
+          "feature": "Stateb"
+        }
+
+      },
+      "projection": {
+        "type": "equirectangular"
+      },
+      "mark": {
+        "type": "geoshape",
+        "stroke": "green",
+        "strokeWidth": 2
+      },
+      "encoding": {
+        "color": {
+          "value": "#0000FF"
+        }
+      }
+    },{
+      "data": {
+        "url": "cache/Prov.json",
+        "format": {
+          "type": "topojson",
+          "feature": "Prov"
+        }
+      },
+      "projection": {
+        "type": "equirectangular"
+      },
+      "mark": {
+        "type": "geoshape",
+        "stroke": "yellow",
+        "strokeWidth": 3
+      },
+      "encoding": {
+        "color": {
+          "value": "#eee"
+        }
+      }
+    },
+    {
+      "data": {
+        "url": "cache/Country.json",
+        "format": {
+          "type": "topojson",
+          "feature": "Country"
+        }
+      },
+      "projection": {
+        "type": "equirectangular"
+      },
+      "mark": {
+        "type": "geoshape",
+        "stroke": "black",
+        "strokeWidth": 2
+      },
+      "encoding": {
+        "color": {
+          "value": "#eee"
+        }
+      }
+    },
+    {
+      "data": {
+        "url": "cache/Species.json",
+        "format": {
+          "type": "topojson",
+          "feature": "Species"
+        }
+      },
+      "projection": {
+        "type": "equirectangular"
+      },
+      "mark": {
+        "type": "geoshape",
+        "stroke": "white",
+        "strokeWidth": 2
+      },
+      "encoding": {
+        "color": {
+          "value": "#dc143c"
+        }
+      }
+    }
+  ]
+}

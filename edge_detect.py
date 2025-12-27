@@ -13,10 +13,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+from matplotlib import pyplot as plt
+from matplotlib.patches import Circle, Rectangle
 from skimage import color, feature, io, util
 from skimage.draw import line as draw_line
 from skimage.measure import label, regionprops
-from skimage.morphology import binary_closing, binary_dilation, disk, remove_small_objects
+from skimage.morphology import closing, dilation, disk, remove_small_objects
 from skimage.transform import probabilistic_hough_line
 
 
@@ -148,12 +150,14 @@ def extract_boxes_from_edges(
 
     mask = edges
     if dilate_radius > 0:
-        mask = binary_dilation(mask, disk(dilate_radius))
+        mask = dilation(mask, disk(dilate_radius))
     if closing_radius > 0:
-        mask = binary_closing(mask, disk(closing_radius))
+        mask = closing(mask, disk(closing_radius))
 
     if min_area > 0:
-        mask = remove_small_objects(mask, min_size=min_area)
+        # skimage>=0.26 deprecates min_size; use max_size to keep only "large enough" components.
+        # Note: max_size removes objects smaller than or equal to its value.
+        mask = remove_small_objects(mask, max_size=int(min_area))
 
     labeled = label(mask)
     boxes: list[tuple[int, int, int, int]] = []
@@ -185,6 +189,77 @@ def extract_boxes_from_lines(
         cc = np.clip(cc, 0, w - 1)
         mask[rr, cc] = True
     return extract_boxes_from_edges(mask, **kwargs)
+
+
+def box_centers(boxes: list[tuple[int, int, int, int]]) -> list[tuple[float, float]]:
+    """
+    Compute (cx, cy) centers for boxes.
+
+    Boxes are (min_row, min_col, max_row, max_col).
+    Returned centers are in image coordinates where x=col, y=row.
+    """
+    centers: list[tuple[float, float]] = []
+    for min_row, min_col, max_row, max_col in boxes:
+        cx = (min_col + max_col) / 2.0
+        cy = (min_row + max_row) / 2.0
+        centers.append((cx, cy))
+    return centers
+
+
+def plot_image_with_boxes_and_centers(
+    image: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    *,
+    circle_radius: float = 5.0,
+    box_color: str = "lime",
+    center_color: str = "red",
+    linewidth: float = 2.0,
+    save_path: str | Path | None = None,
+    show: bool = False,
+) -> None:
+    """
+    Plot the image, draw each box, and draw a circle at each box center.
+    """
+    # Normalize image for display (handle grayscale/RGBA)
+    disp = image
+    if disp.ndim == 3 and disp.shape[-1] == 4:
+        disp = color.rgba2rgb(disp)
+
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=150)
+    ax.imshow(disp, cmap="gray" if disp.ndim == 2 else None)
+    ax.set_axis_off()
+
+    for (min_row, min_col, max_row, max_col) in boxes:
+        w = max_col - min_col
+        h = max_row - min_row
+        ax.add_patch(
+            Rectangle(
+                (min_col, min_row),
+                w,
+                h,
+                fill=False,
+                edgecolor=box_color,
+                linewidth=linewidth,
+            )
+        )
+        cx = (min_col + max_col) / 2.0
+        cy = (min_row + max_row) / 2.0
+        ax.add_patch(
+            Circle(
+                (cx, cy),
+                radius=circle_radius,
+                fill=False,
+                edgecolor=center_color,
+                linewidth=linewidth,
+            )
+        )
+
+    fig.tight_layout(pad=0)
+    if save_path is not None:
+        fig.savefig(str(save_path), bbox_inches="tight", pad_inches=0)
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 def main() -> int:
@@ -230,6 +305,17 @@ def main() -> int:
         default=0.3,
         help="Box extraction: IoU threshold for merging overlaps.",
     )
+    parser.add_argument(
+        "--plot-output",
+        default=None,
+        help="Optional path to save a plot of the image with boxes + center circles.",
+    )
+    parser.add_argument(
+        "--plot-show",
+        action="store_true",
+        help="Show the matplotlib window (may not work in headless environments).",
+    )
+    parser.add_argument("--center-circle-radius", type=float, default=5.0, help="Center circle radius (px).")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -300,6 +386,20 @@ def main() -> int:
         boxes_path = Path(args.boxes_json)
         boxes_path.write_text(json.dumps(boxes_payload, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote boxes JSON to: {boxes_path} ({len(boxes_payload)} boxes)")
+    else:
+        boxes = []
+
+    if args.plot_output or args.plot_show:
+        plot_path = Path(args.plot_output) if args.plot_output else None
+        plot_image_with_boxes_and_centers(
+            image,
+            boxes,
+            circle_radius=args.center_circle_radius,
+            save_path=plot_path,
+            show=args.plot_show,
+        )
+        if plot_path is not None:
+            print(f"Wrote plot to: {plot_path}")
 
     # Save as a visible 8-bit image (0 or 255).
     edges_u8 = (edges_bool.astype(np.uint8) * 255)

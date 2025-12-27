@@ -17,6 +17,7 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from skimage import color, feature, io, util
 from skimage.draw import line as draw_line
+from skimage.filters import threshold_otsu
 from skimage.measure import label, regionprops
 from skimage.morphology import closing, dilation, disk, remove_small_objects
 from skimage.transform import probabilistic_hough_line
@@ -159,7 +160,7 @@ def extract_boxes_from_edges(
         # Note: max_size removes objects smaller than or equal to its value.
         mask = remove_small_objects(mask, max_size=int(min_area))
 
-    labeled = label(mask)
+    labeled = label(mask, connectivity=1)
     boxes: list[tuple[int, int, int, int]] = []
     for r in regionprops(labeled):
         min_row, min_col, max_row, max_col = r.bbox
@@ -189,6 +190,95 @@ def extract_boxes_from_lines(
         cc = np.clip(cc, 0, w - 1)
         mask[rr, cc] = True
     return extract_boxes_from_edges(mask, **kwargs)
+
+
+def extract_chessboard_block_boxes(
+    image: np.ndarray,
+    *,
+    color_name: str = "black",
+    threshold: float | None = None,
+    min_area: int = 50,
+    area_tolerance: float = 0.7,
+    aspect_ratio_tolerance: float = 0.6,
+    clear_border: bool = False,
+    merge_overlaps: bool = False,
+    merge_iou_threshold: float = 0.1,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Extract per-square bounding boxes from a chessboard-like image.
+
+    Strategy:
+    - convert to grayscale float
+    - threshold into "black" or "white" mask
+    - connected components -> candidate square regions
+    - filter by area near the median + roughly square aspect ratio
+
+    Returns boxes as (min_row, min_col, max_row, max_col).
+    """
+    if image.ndim == 3:
+        if image.shape[-1] == 4:
+            image = color.rgba2rgb(image)
+        gray = color.rgb2gray(image)
+    else:
+        gray = util.img_as_float(image)
+
+    if threshold is not None:
+        t = float(threshold)
+    else:
+        # Otsu can be unstable on already-binarized images (e.g., only {0,1}),
+        # where it may return 0.0 or 1.0. Detect that and pick mid-point.
+        vals = np.unique(gray)
+        if vals.size <= 2:
+            t = float(vals.min() + (vals.max() - vals.min()) / 2.0)
+        else:
+            t = float(threshold_otsu(gray))
+    if color_name not in {"black", "white"}:
+        raise ValueError("color_name must be 'black' or 'white'")
+
+    mask = (gray < t) if color_name == "black" else (gray > t)
+    if min_area > 0:
+        # Keep only components larger than ~min_area by removing smaller ones.
+        mask = remove_small_objects(mask.astype(bool), max_size=int(min_area))
+
+    labeled = label(mask, connectivity=1)
+    regions = regionprops(labeled)
+    if not regions:
+        return []
+
+    # Robust size estimate: median area across many squares.
+    areas = np.array([r.area for r in regions], dtype=float)
+    median_area = float(np.median(areas))
+    lo_area = median_area * (1.0 - float(area_tolerance))
+    hi_area = median_area * (1.0 + float(area_tolerance))
+
+    h, w = gray.shape[:2]
+    boxes: list[tuple[int, int, int, int]] = []
+    for r in regions:
+        if clear_border:
+            min_row, min_col, max_row, max_col = r.bbox
+            if min_row <= 0 or min_col <= 0 or max_row >= h or max_col >= w:
+                continue
+
+        area = float(r.area)
+        if area < lo_area or area > hi_area:
+            continue
+
+        min_row, min_col, max_row, max_col = r.bbox
+        bh = max_row - min_row
+        bw = max_col - min_col
+        if bh <= 0 or bw <= 0:
+            continue
+        ar = bw / float(bh)
+        if not (1.0 - aspect_ratio_tolerance <= ar <= 1.0 + aspect_ratio_tolerance):
+            continue
+
+        boxes.append((int(min_row), int(min_col), int(max_row), int(max_col)))
+
+    if merge_overlaps and boxes:
+        boxes = _merge_overlapping_boxes(boxes, iou_threshold=merge_iou_threshold)
+
+    boxes.sort(key=lambda b: (b[0], b[1], b[2], b[3]))
+    return boxes
 
 
 def box_centers(boxes: list[tuple[int, int, int, int]]) -> list[tuple[float, float]]:
@@ -292,7 +382,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--boxes-from",
-        choices=("edges", "lines"),
+        choices=("edges", "lines", "chessboard-black", "chessboard-white", "chessboard-both"),
         default="edges",
         help="Whether to extract boxes from the edge map or from detected lines.",
     )
@@ -304,6 +394,25 @@ def main() -> int:
         type=float,
         default=0.3,
         help="Box extraction: IoU threshold for merging overlaps.",
+    )
+    parser.add_argument(
+        "--chess-threshold",
+        type=float,
+        default=None,
+        help="Chessboard threshold in [0..1] (default: Otsu).",
+    )
+    parser.add_argument("--chess-min-area", type=int, default=50, help="Chessboard: minimum component area (px).")
+    parser.add_argument(
+        "--chess-area-tol",
+        type=float,
+        default=0.7,
+        help="Chessboard: keep regions within (1±tol)*median_area.",
+    )
+    parser.add_argument(
+        "--chess-ar-tol",
+        type=float,
+        default=0.6,
+        help="Chessboard: aspect ratio tolerance around 1.0.",
     )
     parser.add_argument(
         "--plot-output",
@@ -361,6 +470,35 @@ def main() -> int:
                 merge_overlaps=True,
                 merge_iou_threshold=args.box_merge_iou,
             )
+        elif args.boxes_from.startswith("chessboard-"):
+            if args.boxes_from == "chessboard-both":
+                boxes_black = extract_chessboard_block_boxes(
+                    image,
+                    color_name="black",
+                    threshold=args.chess_threshold,
+                    min_area=args.chess_min_area,
+                    area_tolerance=args.chess_area_tol,
+                    aspect_ratio_tolerance=args.chess_ar_tol,
+                )
+                boxes_white = extract_chessboard_block_boxes(
+                    image,
+                    color_name="white",
+                    threshold=args.chess_threshold,
+                    min_area=args.chess_min_area,
+                    area_tolerance=args.chess_area_tol,
+                    aspect_ratio_tolerance=args.chess_ar_tol,
+                )
+                boxes = sorted(set(boxes_black + boxes_white), key=lambda b: (b[0], b[1], b[2], b[3]))
+            else:
+                chess_color = "black" if args.boxes_from == "chessboard-black" else "white"
+                boxes = extract_chessboard_block_boxes(
+                    image,
+                    color_name=chess_color,
+                    threshold=args.chess_threshold,
+                    min_area=args.chess_min_area,
+                    area_tolerance=args.chess_area_tol,
+                    aspect_ratio_tolerance=args.chess_ar_tol,
+                )
         else:
             boxes = extract_boxes_from_edges(
                 edges_bool,

@@ -14,6 +14,9 @@ from pathlib import Path
 
 import numpy as np
 from skimage import color, feature, io, util
+from skimage.draw import line as draw_line
+from skimage.measure import label, regionprops
+from skimage.morphology import binary_closing, binary_dilation, disk, remove_small_objects
 from skimage.transform import probabilistic_hough_line
 
 
@@ -70,6 +73,120 @@ def extract_lines_from_edges(
     return [((int(x0), int(y0)), (int(x1), int(y1))) for (x0, y0), (x1, y1) in lines]
 
 
+def _merge_overlapping_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    *,
+    iou_threshold: float = 0.3,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Greedily merge boxes whose IoU exceeds iou_threshold.
+
+    Boxes are (min_row, min_col, max_row, max_col).
+    """
+
+    def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ar0, ac0, ar1, ac1 = a
+        br0, bc0, br1, bc1 = b
+        ir0, ic0 = max(ar0, br0), max(ac0, bc0)
+        ir1, ic1 = min(ar1, br1), min(ac1, bc1)
+        ih, iw = max(0, ir1 - ir0), max(0, ic1 - ic0)
+        inter = ih * iw
+        if inter == 0:
+            return 0.0
+        area_a = max(0, ar1 - ar0) * max(0, ac1 - ac0)
+        area_b = max(0, br1 - br0) * max(0, bc1 - bc0)
+        union = area_a + area_b - inter
+        return float(inter) / float(union) if union else 0.0
+
+    def union(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        ar0, ac0, ar1, ac1 = a
+        br0, bc0, br1, bc1 = b
+        return (min(ar0, br0), min(ac0, bc0), max(ar1, br1), max(ac1, bc1))
+
+    merged = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        out: list[tuple[int, int, int, int]] = []
+        while merged:
+            current = merged.pop()
+            did_merge = False
+            for idx, other in enumerate(merged):
+                if iou(current, other) >= iou_threshold:
+                    merged[idx] = union(current, other)
+                    did_merge = True
+                    changed = True
+                    break
+            if not did_merge:
+                out.append(current)
+        merged = out
+    return merged
+
+
+def extract_boxes_from_edges(
+    edges: np.ndarray,
+    *,
+    dilate_radius: int = 1,
+    closing_radius: int = 3,
+    min_area: int = 200,
+    merge_overlaps: bool = True,
+    merge_iou_threshold: float = 0.3,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Extract bounding boxes from an edge map.
+
+    This is a pragmatic approach:
+    - dilate edges to connect gaps
+    - close to form thicker, more continuous contours
+    - remove tiny components
+    - connected-components -> bounding boxes
+
+    Returns boxes as (min_row, min_col, max_row, max_col).
+    """
+    if edges.dtype != bool:
+        edges = edges.astype(bool)
+
+    mask = edges
+    if dilate_radius > 0:
+        mask = binary_dilation(mask, disk(dilate_radius))
+    if closing_radius > 0:
+        mask = binary_closing(mask, disk(closing_radius))
+
+    if min_area > 0:
+        mask = remove_small_objects(mask, min_size=min_area)
+
+    labeled = label(mask)
+    boxes: list[tuple[int, int, int, int]] = []
+    for r in regionprops(labeled):
+        min_row, min_col, max_row, max_col = r.bbox
+        boxes.append((int(min_row), int(min_col), int(max_row), int(max_col)))
+
+    if merge_overlaps and boxes:
+        boxes = _merge_overlapping_boxes(boxes, iou_threshold=merge_iou_threshold)
+
+    # stable order: top-to-bottom then left-to-right
+    boxes.sort(key=lambda b: (b[0], b[1], b[2], b[3]))
+    return boxes
+
+
+def extract_boxes_from_lines(
+    lines: list[tuple[tuple[int, int], tuple[int, int]]],
+    image_shape: tuple[int, int],
+    **kwargs,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Rasterize line segments into a mask, then call extract_boxes_from_edges().
+    """
+    h, w = int(image_shape[0]), int(image_shape[1])
+    mask = np.zeros((h, w), dtype=bool)
+    for (x0, y0), (x1, y1) in lines:
+        rr, cc = draw_line(int(y0), int(x0), int(y1), int(x1))
+        rr = np.clip(rr, 0, h - 1)
+        cc = np.clip(cc, 0, w - 1)
+        mask[rr, cc] = True
+    return extract_boxes_from_edges(mask, **kwargs)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Edge detection with scikit-image (Canny).")
     parser.add_argument(
@@ -93,6 +210,26 @@ def main() -> int:
     parser.add_argument("--hough-threshold", type=int, default=10, help="Hough accumulator threshold.")
     parser.add_argument("--hough-line-length", type=int, default=50, help="Minimum accepted line length (px).")
     parser.add_argument("--hough-line-gap", type=int, default=10, help="Maximum gap between pixels (px).")
+    parser.add_argument(
+        "--boxes-json",
+        default=None,
+        help="Optional path to write extracted bounding boxes as JSON.",
+    )
+    parser.add_argument(
+        "--boxes-from",
+        choices=("edges", "lines"),
+        default="edges",
+        help="Whether to extract boxes from the edge map or from detected lines.",
+    )
+    parser.add_argument("--box-dilate-radius", type=int, default=1, help="Box extraction: dilation radius (px).")
+    parser.add_argument("--box-closing-radius", type=int, default=3, help="Box extraction: closing radius (px).")
+    parser.add_argument("--box-min-area", type=int, default=200, help="Box extraction: minimum component area (px).")
+    parser.add_argument(
+        "--box-merge-iou",
+        type=float,
+        default=0.3,
+        help="Box extraction: IoU threshold for merging overlaps.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -109,19 +246,60 @@ def main() -> int:
         high_threshold=args.high_threshold,
     )
 
-    if args.lines_json:
+    lines: list[tuple[tuple[int, int], tuple[int, int]]] | None = None
+    if args.lines_json or (args.boxes_json and args.boxes_from == "lines"):
         lines = extract_lines_from_edges(
             edges_bool,
             threshold=args.hough_threshold,
             line_length=args.hough_line_length,
             line_gap=args.hough_line_gap,
         )
-        lines_payload = [
-            {"x0": x0, "y0": y0, "x1": x1, "y1": y1} for ((x0, y0), (x1, y1)) in lines
+        if args.lines_json:
+            lines_payload = [
+                {"x0": x0, "y0": y0, "x1": x1, "y1": y1} for ((x0, y0), (x1, y1)) in lines
+            ]
+            lines_path = Path(args.lines_json)
+            lines_path.write_text(json.dumps(lines_payload, indent=2) + "\n", encoding="utf-8")
+            print(f"Wrote lines JSON to: {lines_path} ({len(lines_payload)} segments)")
+
+    if args.boxes_json:
+        if args.boxes_from == "lines":
+            if lines is None:
+                lines = []
+            boxes = extract_boxes_from_lines(
+                lines,
+                edges_bool.shape[:2],
+                dilate_radius=args.box_dilate_radius,
+                closing_radius=args.box_closing_radius,
+                min_area=args.box_min_area,
+                merge_overlaps=True,
+                merge_iou_threshold=args.box_merge_iou,
+            )
+        else:
+            boxes = extract_boxes_from_edges(
+                edges_bool,
+                dilate_radius=args.box_dilate_radius,
+                closing_radius=args.box_closing_radius,
+                min_area=args.box_min_area,
+                merge_overlaps=True,
+                merge_iou_threshold=args.box_merge_iou,
+            )
+        boxes_payload = [
+            {
+                "x": int(min_col),
+                "y": int(min_row),
+                "w": int(max_col - min_col),
+                "h": int(max_row - min_row),
+                "min_row": int(min_row),
+                "min_col": int(min_col),
+                "max_row": int(max_row),
+                "max_col": int(max_col),
+            }
+            for (min_row, min_col, max_row, max_col) in boxes
         ]
-        lines_path = Path(args.lines_json)
-        lines_path.write_text(json.dumps(lines_payload, indent=2) + "\n", encoding="utf-8")
-        print(f"Wrote lines JSON to: {lines_path} ({len(lines_payload)} segments)")
+        boxes_path = Path(args.boxes_json)
+        boxes_path.write_text(json.dumps(boxes_payload, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote boxes JSON to: {boxes_path} ({len(boxes_payload)} boxes)")
 
     # Save as a visible 8-bit image (0 or 255).
     edges_u8 = (edges_bool.astype(np.uint8) * 255)
